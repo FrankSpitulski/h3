@@ -1,7 +1,7 @@
 use std::{
     convert::TryFrom,
     marker::PhantomData,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     task::{Context, Poll},
 };
 
@@ -21,7 +21,6 @@ use crate::{
     stream::{AcceptRecvStream, AcceptedRecvStream},
 };
 
-#[derive(Clone)]
 #[doc(hidden)]
 pub struct SharedState {
     // maximum size for a header we send
@@ -32,7 +31,17 @@ pub struct SharedState {
 
 #[derive(Clone)]
 #[doc(hidden)]
-pub struct SharedStateRef(pub Arc<RwLock<SharedState>>);
+pub struct SharedStateRef(Arc<RwLock<SharedState>>);
+
+impl SharedStateRef {
+    pub fn read(&self, panic_msg: &'static str) -> RwLockReadGuard<SharedState> {
+        self.0.read().expect(panic_msg)
+    }
+
+    pub fn write(&self, panic_msg: &'static str) -> RwLockWriteGuard<SharedState> {
+        self.0.write().expect(panic_msg)
+    }
+}
 
 impl Default for SharedStateRef {
     fn default() -> Self {
@@ -40,6 +49,18 @@ impl Default for SharedStateRef {
             peer_max_field_section_size: VarInt::MAX.0,
             error: None,
         })))
+    }
+}
+
+pub trait ConnectionState {
+    fn shared_state(&self) -> &SharedStateRef;
+
+    fn maybe_conn_err<E: Into<Error>>(&self, err: E) -> Error {
+        if let Some(ref e) = self.shared_state().0.read().unwrap().error {
+            e.clone()
+        } else {
+            err.into()
+        }
     }
 }
 
@@ -150,9 +171,7 @@ where
                 Frame::Settings(settings) if !self.got_peer_settings => {
                     self.got_peer_settings = true;
                     self.shared
-                        .0
-                        .write()
-                        .expect("connection settings write")
+                        .write("connection settings write")
                         .peer_max_field_section_size = settings
                         .get(SettingId::MAX_HEADER_LIST_SIZE)
                         .unwrap_or(VarInt::MAX.0);
@@ -197,6 +216,12 @@ impl<S, B> RequestStream<S, B> {
     }
 }
 
+impl<S, B> ConnectionState for RequestStream<S, B> {
+    fn shared_state(&self) -> &SharedStateRef {
+        &self.conn_state
+    }
+}
+
 impl<S> RequestStream<FrameStream<S>, Bytes>
 where
     S: quic::RecvStream,
@@ -204,7 +229,10 @@ where
     /// Receive some of the request body.
     pub async fn recv_data(&mut self) -> Result<Option<Bytes>, Error> {
         if !self.stream.has_data() {
-            match future::poll_fn(|cx| self.stream.poll_next(cx)).await? {
+            let frame = future::poll_fn(|cx| self.stream.poll_next(cx))
+                .await
+                .map_err(|e| self.maybe_conn_err(e))?;
+            match frame {
                 Some(Frame::Data { .. }) => (),
                 Some(Frame::Headers(encoded)) => {
                     self.trailers = Some(encoded);
@@ -215,7 +243,10 @@ where
             }
         }
 
-        Ok(future::poll_fn(|cx| self.stream.poll_data(cx)).await?)
+        let data = future::poll_fn(|cx| self.stream.poll_data(cx))
+            .await
+            .map_err(|e| self.maybe_conn_err(e))?;
+        Ok(data)
     }
 
     /// Receive trailers
@@ -223,7 +254,10 @@ where
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
-            match future::poll_fn(|cx| self.stream.poll_next(cx)).await? {
+            let frame = future::poll_fn(|cx| self.stream.poll_next(cx))
+                .await
+                .map_err(|e| self.maybe_conn_err(e))?;
+            match frame {
                 Some(Frame::Headers(encoded)) => encoded,
                 Some(_) => return Err(Code::H3_FRAME_UNEXPECTED.into()),
                 None => return Ok(None),
@@ -249,19 +283,19 @@ where
 {
     /// Send some data on the response body.
     pub async fn send_data(&mut self, buf: Bytes) -> Result<(), Error> {
-        stream::write(
-            &mut self.stream,
-            Frame::Data {
-                len: buf.len() as u64,
-            },
-        )
-        .await?;
+        let frame = Frame::Data {
+            len: buf.len() as u64,
+        };
+        stream::write(&mut self.stream, frame)
+            .await
+            .map_err(|e| self.maybe_conn_err(e))?;
+
         self.stream
             .send_data(buf)
-            .map_err(|e| Code::H3_GENERAL_PROTOCOL_ERROR.with_cause(e))?;
+            .map_err(|e| self.maybe_conn_err(Error::transport(e)))?;
         future::poll_fn(|cx| self.stream.poll_ready(cx))
             .await
-            .map_err(|e| Code::H3_GENERAL_PROTOCOL_ERROR.with_cause(e))?;
+            .map_err(|e| self.maybe_conn_err(Error::transport(e)))?;
 
         Ok(())
     }
@@ -280,7 +314,9 @@ where
             return Err(Error::header_too_big(mem_size, max_mem_size));
         }
 
-        stream::write(&mut self.stream, Frame::Headers(block.freeze())).await?;
+        stream::write(&mut self.stream, Frame::Headers(block.freeze()))
+            .await
+            .map_err(|e| self.maybe_conn_err(e))?;
 
         Ok(())
     }
@@ -288,9 +324,9 @@ where
     pub async fn finish(&mut self) -> Result<(), Error> {
         future::poll_fn(|cx| self.stream.poll_ready(cx))
             .await
-            .map_err(|e| Code::H3_GENERAL_PROTOCOL_ERROR.with_cause(e))?;
+            .map_err(|e| self.maybe_conn_err(Error::transport(e)))?;
         future::poll_fn(|cx| self.stream.poll_finish(cx))
             .await
-            .map_err(|e| Code::H3_GENERAL_PROTOCOL_ERROR.with_cause(e))
+            .map_err(|e| self.maybe_conn_err(Error::transport(e)))
     }
 }
