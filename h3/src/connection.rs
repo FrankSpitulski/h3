@@ -24,7 +24,10 @@ use crate::{
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct SharedState {
-    pub peer_max_field_section_size: u64, // maximum size for a header we send
+    // maximum size for a header we send
+    pub peer_max_field_section_size: u64,
+    // connection-wide error, concerns all RequestStreams and drivers
+    pub error: Option<Error>,
 }
 
 #[derive(Clone)]
@@ -35,6 +38,7 @@ impl Default for SharedStateRef {
     fn default() -> Self {
         Self(Arc::new(RwLock::new(SharedState {
             peer_max_field_section_size: VarInt::MAX.0,
+            error: None,
         })))
     }
 }
@@ -164,6 +168,12 @@ where
             },
         };
         Poll::Ready(res)
+    }
+
+    pub fn close(&mut self, code: Code, reason: &str) -> Error {
+        self.shared.0.write().expect("connection close err").error = Some(code.with_reason(reason));
+        self.conn.close(code, reason.as_bytes());
+        code.with_reason(reason)
     }
 }
 

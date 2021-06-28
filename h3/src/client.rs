@@ -106,6 +106,14 @@ where
                 }
             }
         }
+
+        if let Poll::Ready(_) = self.inner.poll_accept_request(cx) {
+            return Poll::Ready(Err(self.inner.close(
+                Code::H3_STREAM_CREATION_ERROR,
+                "client received a bidirectionnal stream",
+            )));
+        }
+
         Poll::Pending
     }
 }
